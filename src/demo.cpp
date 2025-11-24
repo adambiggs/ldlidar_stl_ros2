@@ -22,7 +22,7 @@
 #include "ros2_api.h"
 #include "ldlidar_driver.h"
 
-void  ToLaserscanMessagePublish(ldlidar::Points2D& src, double lidar_spin_freq, LaserScanSetting& setting,
+void  ToLaserscanMessagePublish(ldlidar::LaserScan& src, double lidar_spin_freq, LaserScanSetting& setting,
   rclcpp::Node::SharedPtr& node, rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr& lidarpub);
 
 uint64_t GetSystemTimeStamp(void);
@@ -110,16 +110,16 @@ int main(int argc, char **argv) {
   rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr publisher = 
       node->create_publisher<sensor_msgs::msg::LaserScan>(topic_name, 10);
   
-  rclcpp::WallRate r(10); //10hz
+  rclcpp::WallRate r(60); // 60hz to drain buffer faster (LiDAR is 10Hz)
 
-  ldlidar::Points2D laser_scan_points;
+  ldlidar::LaserScan laser_scan;
   double lidar_scan_freq;
   RCLCPP_INFO(node->get_logger(), "Publish topic message:ldlidar scan data.");
   while (rclcpp::ok()) {
-    switch (ldlidarnode->GetLaserScanData(laser_scan_points, 1500)){
+    switch (ldlidarnode->GetLaserScanData(laser_scan, 1500)){
       case ldlidar::LidarStatus::NORMAL: 
         ldlidarnode->GetLidarScanFreq(lidar_scan_freq);
-        ToLaserscanMessagePublish(laser_scan_points, lidar_scan_freq, setting, node, publisher);
+        ToLaserscanMessagePublish(laser_scan, lidar_scan_freq, setting, node, publisher);
         break;
       case ldlidar::LidarStatus::DATA_TIME_OUT:
         RCLCPP_ERROR(node->get_logger(), "get ldlidar data is time out, please check your lidar device.");
@@ -144,7 +144,7 @@ int main(int argc, char **argv) {
   return 0;
 }
 
-void  ToLaserscanMessagePublish(ldlidar::Points2D& src,  double lidar_spin_freq, LaserScanSetting& setting,
+void  ToLaserscanMessagePublish(ldlidar::LaserScan& src,  double lidar_spin_freq, LaserScanSetting& setting,
   rclcpp::Node::SharedPtr& node, rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr& lidarpub) {
   float angle_min, angle_max, range_min, range_max, angle_increment;
   double scan_time;
@@ -152,20 +152,29 @@ void  ToLaserscanMessagePublish(ldlidar::Points2D& src,  double lidar_spin_freq,
   static rclcpp::Time end_scan_time;
   static bool first_scan = true;
 
-  start_scan_time = node->now();
-  scan_time = (start_scan_time.seconds() - end_scan_time.seconds());
-
+  // Use timestamp from packet (Arrival of First Point) instead of node->now() (Processing Time)
+  // This fixes "Map Dragging" where old buffered data is stamped as "Now".
+  start_scan_time = rclcpp::Time(src.stamp);
+  
   if (first_scan) {
     first_scan = false;
     end_scan_time = start_scan_time;
     return;
   }
+
+  // Calculate scan duration from frequency if available, or difference
+  if (lidar_spin_freq > 0) {
+      scan_time = 1.0 / lidar_spin_freq;
+  } else {
+      scan_time = (start_scan_time.seconds() - end_scan_time.seconds());
+  }
+
   // Adjust the parameters according to the demand
   angle_min = 0;
   angle_max = (2 * M_PI);
   range_min = 0.02;
   range_max = 25;
-  int beam_size = static_cast<int>(src.size());
+  int beam_size = static_cast<int>(src.points.size());
   angle_increment = (angle_max - angle_min) / (float)(beam_size -1);
   // Calculate the number of scanning points
   if (lidar_spin_freq > 0) {
@@ -186,7 +195,7 @@ void  ToLaserscanMessagePublish(ldlidar::Points2D& src,  double lidar_spin_freq,
     // First fill all the data with Nan
     output.ranges.assign(beam_size, std::numeric_limits<float>::quiet_NaN());
     output.intensities.assign(beam_size, std::numeric_limits<float>::quiet_NaN());
-    for (auto point : src) {
+    for (auto point : src.points) {
       float range = point.distance / 1000.f;  // distance unit transform to meters
       float intensity = point.intensity;      // laser receive intensity 
       float dir_angle = point.angle;
