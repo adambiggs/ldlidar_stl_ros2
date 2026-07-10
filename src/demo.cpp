@@ -21,6 +21,7 @@
 
 #include "ros2_api.h"
 #include "ldlidar_driver.h"
+#include "scan_time_reconstruct.h"
 
 void  ToLaserscanMessagePublish(ldlidar::LaserScan& src, double lidar_spin_freq, LaserScanSetting& setting,
   rclcpp::Node::SharedPtr& node, rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr& lidarpub);
@@ -180,130 +181,105 @@ int main(int argc, char **argv) {
 
 void  ToLaserscanMessagePublish(ldlidar::LaserScan& src,  double lidar_spin_freq, LaserScanSetting& setting,
   rclcpp::Node::SharedPtr& node, rclcpp::Publisher<sensor_msgs::msg::LaserScan>::SharedPtr& lidarpub) {
-  float angle_min, angle_max, angle_increment;
-  double scan_time;
-  rclcpp::Time start_scan_time;
-  static rclcpp::Time end_scan_time;
-  static bool first_scan = true;
+  // Rotation-model measurement-time reconstruction (BUG-0050 / Story 059.3): the
+  // frame stamp and per-point timing derive from the LiDAR's reported spin rate,
+  // not serial-arrival time, so a batched read() that collapses per-packet arrival
+  // stamps cannot reach the published scan. State persists across frames.
+  static ldlidar::ScanStartReconstructor scan_start_recon;
 
-  // MERGE RESOLUTION:
-  // 1. Keep the timestamp fix (use packet timestamp instead of node->now())
-  // 2. Keep the binning logic from PR #14
+  const int beam_size = (setting.bins > 0)
+    ? setting.bins
+    : static_cast<int>(src.points.size());
 
-  // Use timestamp from packet (Arrival of First Point) instead of node->now() (Processing Time)
-  // This fixes "Map Dragging" where old buffered data is stamped as "Now".
-  start_scan_time = rclcpp::Time(src.stamp);
-  
-  int beam_size = 0;
-
-  if (setting.bins > 0) {
-    beam_size = setting.bins;
-  } else {
-    beam_size = static_cast<int>(src.points.size());
+  // NFF: no plausible rotation model for this frame -> log and skip, never present
+  // a serial-arrival stamp as measurement time.
+  if (beam_size <= 1 || lidar_spin_freq <= 0.0) {
+    RCLCPP_WARN(node->get_logger(),
+      "ldlidar: no rotation model (beam_size=%d, spin=%.3f Hz); skipping frame",
+      beam_size, lidar_spin_freq);
+    return;
   }
-
-  scan_time = (start_scan_time.seconds() - end_scan_time.seconds());
-
-  if (first_scan) {
-    first_scan = false;
-    end_scan_time = start_scan_time;
+  const double scan_time = 1.0 / lidar_spin_freq;  // one rotation period (s)
+  if (scan_time < 0.02 || scan_time > 0.5) {        // implausible outside ~2..50 Hz
+    RCLCPP_WARN(node->get_logger(),
+      "ldlidar: implausible spin %.2f Hz (period %.3f s); skipping frame",
+      lidar_spin_freq, scan_time);
     return;
   }
 
-  // Calculate scan duration from frequency if available, or difference
-  if (lidar_spin_freq > 0) {
-      scan_time = 1.0 / lidar_spin_freq;
-  } else {
-      scan_time = (start_scan_time.seconds() - end_scan_time.seconds());
-  }
+  // Frame stamp: a fresh CLOCK_REALTIME sample at publish, reconstructed against the
+  // rotation cadence (immune to batched-read collapse; see scan_time_reconstruct.h).
+  const int64_t period_ns = static_cast<int64_t>(scan_time * 1e9);
+  const int64_t stamp_ns = scan_start_recon.Update(
+    static_cast<int64_t>(GetSystemTimeStamp()), period_ns);
 
-  // Adjust the parameters according to the demand
-  angle_min = 0;
-  angle_max = (2 * M_PI);
-  angle_increment = (angle_max - angle_min) / (float)(beam_size -1);
-  // Calculate the number of scanning points
-  if (lidar_spin_freq > 0) {
-    sensor_msgs::msg::LaserScan output;
-    output.header.stamp = start_scan_time;
-    output.header.frame_id = setting.frame_id;
-    output.angle_min = angle_min;
-    output.angle_max = angle_max;
-    output.range_min = setting.range_min;
-    output.range_max = setting.range_max;
-    output.angle_increment = angle_increment;
-    if (beam_size <= 1) {
-      output.time_increment = 0;
-    } else {
-      output.time_increment = static_cast<float>(scan_time / (double)(beam_size - 1));
+  // Encoding (b): forward measurement order + non-negative time_increment; the
+  // laser_scan_dir counterclockwise reflection is carried by the signed angle
+  // fields (a consistent negative-increment triple for rtabmap's guard).
+  const ldlidar::ScanAngleTiming timing =
+    ldlidar::ComputeScanAngleTiming(beam_size, scan_time, setting.laser_scan_dir);
+
+  sensor_msgs::msg::LaserScan output;
+  output.header.stamp = rclcpp::Time(stamp_ns);
+  output.header.frame_id = setting.frame_id;
+  output.angle_min = timing.angle_min;
+  output.angle_max = timing.angle_max;
+  output.angle_increment = timing.angle_increment;
+  output.time_increment = timing.time_increment;
+  output.scan_time = timing.scan_time;
+  output.range_min = setting.range_min;
+  output.range_max = setting.range_max;
+  // First fill all the data with Nan
+  output.ranges.assign(beam_size, std::numeric_limits<float>::quiet_NaN());
+  output.intensities.assign(beam_size, std::numeric_limits<float>::quiet_NaN());
+
+  // Bin index from the real (unsigned) angular step, decoupled from the published
+  // (possibly negative) angle_increment: output[index] holds the index-th-measured
+  // point -> array order == measurement/sweep order (encoding (b)).
+  const float bin_increment = static_cast<float>(2.0 * M_PI) / static_cast<float>(beam_size - 1);
+
+  for (auto point : src.points) {
+    float range = point.distance / 1000.f;  // distance unit transform to meters
+    float intensity = point.intensity;      // laser receive intensity
+    float dir_angle = point.angle;
+
+    if ((point.distance == 0) && (point.intensity == 0)) { // filter is handled to  0, Nan will be assigned variable.
+      range = std::numeric_limits<float>::quiet_NaN();
+      intensity = std::numeric_limits<float>::quiet_NaN();
     }
-    output.scan_time = scan_time;
-    // First fill all the data with Nan
-    output.ranges.assign(beam_size, std::numeric_limits<float>::quiet_NaN());
-    output.intensities.assign(beam_size, std::numeric_limits<float>::quiet_NaN());
-    for (auto point : src.points) {
-      float range = point.distance / 1000.f;  // distance unit transform to meters
-      float intensity = point.intensity;      // laser receive intensity 
-      float dir_angle = point.angle;
 
-      if ((point.distance == 0) && (point.intensity == 0)) { // filter is handled to  0, Nan will be assigned variable.
-        range = std::numeric_limits<float>::quiet_NaN(); 
+    if (setting.enable_angle_crop_func) { // Angle crop setting, Mask data within the set angle range
+      if ((dir_angle >= setting.angle_crop_min) && (dir_angle <= setting.angle_crop_max)) {
+        range = std::numeric_limits<float>::quiet_NaN();
         intensity = std::numeric_limits<float>::quiet_NaN();
       }
+    }
 
-      if (setting.enable_angle_crop_func) { // Angle crop setting, Mask data within the set angle range
-        if ((dir_angle >= setting.angle_crop_min) && (dir_angle <= setting.angle_crop_max)) {
-          range = std::numeric_limits<float>::quiet_NaN();
-          intensity = std::numeric_limits<float>::quiet_NaN();
-        }
-      }
-
-      if (setting.enable_box_crop_func) { // Box crop setting, Mask data within the box
-        double x = range*cos(dir_angle*M_PI/180);
-        double y = -range*sin(dir_angle*M_PI/180);
-        if (x > setting.x_crop_min && x < setting.x_crop_max &&
-            y > setting.y_crop_min && y < setting.y_crop_max) {
-          range = std::numeric_limits<float>::quiet_NaN();
-          intensity = std::numeric_limits<float>::quiet_NaN();
-        }
-      }
-
-      float angle = ANGLE_TO_RADIAN(dir_angle); // Lidar angle unit form degree transform to radian
-      int index = static_cast<int>(ceil((angle - angle_min) / angle_increment));
-      if (index < beam_size) {
-        if (index < 0) {
-          RCLCPP_ERROR(node->get_logger(), "error index: %d, beam_size: %d, angle: %f, output.angle_min: %f, output.angle_increment: %f", 
-            index, beam_size, angle, angle_min, angle_increment);
-        }
-
-        if (setting.laser_scan_dir) {
-          int index_anticlockwise = beam_size - index - 1;
-          // If the current content is Nan, it is assigned directly
-          if (std::isnan(output.ranges[index_anticlockwise])) {
-            output.ranges[index_anticlockwise] = range;
-          } else { // Otherwise, only when the distance is less than the current
-                    //   value, it can be re assigned
-            if (range < output.ranges[index_anticlockwise]) {
-                output.ranges[index_anticlockwise] = range;
-            }
-          }
-          output.intensities[index_anticlockwise] = intensity;
-        } else {
-          // If the current content is Nan, it is assigned directly
-          if (std::isnan(output.ranges[index])) {
-            output.ranges[index] = range;
-          } else { // Otherwise, only when the distance is less than the current
-                  //   value, it can be re assigned
-            if (range < output.ranges[index]) {
-              output.ranges[index] = range;
-            }
-          }
-          output.intensities[index] = intensity;
-        }
+    if (setting.enable_box_crop_func) { // Box crop setting, Mask data within the box
+      double x = range*cos(dir_angle*M_PI/180);
+      double y = -range*sin(dir_angle*M_PI/180);
+      if (x > setting.x_crop_min && x < setting.x_crop_max &&
+          y > setting.y_crop_min && y < setting.y_crop_max) {
+        range = std::numeric_limits<float>::quiet_NaN();
+        intensity = std::numeric_limits<float>::quiet_NaN();
       }
     }
-    lidarpub->publish(output);
-    end_scan_time = start_scan_time;
-  } 
+
+    float angle = ANGLE_TO_RADIAN(dir_angle); // Lidar angle unit form degree transform to radian
+    int index = static_cast<int>(ceil(angle / bin_increment));
+    if (index >= 0 && index < beam_size) {
+      // Keep the nearest return when multiple points bin to one index.
+      if (std::isnan(output.ranges[index]) || range < output.ranges[index]) {
+        output.ranges[index] = range;
+      }
+      output.intensities[index] = intensity;
+    } else if (index < 0) {
+      RCLCPP_ERROR(node->get_logger(),
+        "error index: %d, beam_size: %d, angle: %f, bin_increment: %f",
+        index, beam_size, angle, bin_increment);
+    }
+  }
+  lidarpub->publish(output);
 }
 
 uint64_t GetSystemTimeStamp(void) {

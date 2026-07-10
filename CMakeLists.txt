@@ -70,5 +70,11 @@ install(DIRECTORY launch rviz2
   DESTINATION share/${PROJECT_NAME}/
 )
 
+# Story 059.3: export the pure rotation-model reconstruction header so the
+# tombo_nerves test suite links the real production unit (not a paraphrase, TVT).
+install(FILES ldlidar_driver/include/dataprocess/scan_time_reconstruct.h
+  DESTINATION include/${PROJECT_NAME}
+)
+ament_export_include_directories(include)
 
 ament_package()
